@@ -16,6 +16,4 @@ struct mem_page {
     void *data;
 };
 
-struct mem_page *mem_page_create();
-
 #endif //MEM_PAGE_H
