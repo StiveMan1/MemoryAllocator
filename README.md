@@ -1,79 +1,188 @@
-# ⚡ Custom Memory Allocator — ~10x Faster Than `malloc`/`free`
+# Custom Memory Allocator
 
-This is a fun little project where we built our own memory allocator in C.\
-Yes, we know `malloc` and `free` are good — but we made it better (for small sizes, at least).\
-The allocator here can be up to 10x faster for small and frequent allocations.
+A custom memory allocator written in C for experimenting with fast small-object
+allocation. The allocator is built around pages, pools, fixed-size blocks, and a
+small context object that tracks allocator state.
 
-## 📁 What's Inside?
-This project is structured like this
+The benchmark in `main.c` compares this allocator with the standard
+`malloc`/`free` path. For workloads with many repeated small allocations, this
+pool-based design can be much faster than a general-purpose allocator.
 
-```graphql
-./
-├── main.c                # Compares classic malloc/free vs our custom allocator
+## Features
+
+- Fast allocation for small blocks up to `4096` bytes.
+- Size-class selection as part of a best-fit strategy.
+- Significantly reduced fragmentation by separating allocations into pools by
+  aligned size class.
+- Automatic fallback to `malloc`, `calloc`, `realloc`, and `free` for larger
+  allocations.
+- Per-pool free lists for reusing released blocks.
+- Red-black tree lookup for finding the page that owns a pointer.
+- Reusable pages: empty pages are kept for future allocations.
+- Public API for `mem_malloc`, `mem_calloc`, `mem_realloc`, and `mem_free`.
+
+## Project Layout
+
+```text
+.
+├── main.c                # Benchmark and allocator demo
 ├── memory/
-│   ├── mem_ctx.c         # Core allocator logic (pool management, tree handling)
-│   ├── mem_ctx.h         # Context and allocator interface
-│   ├── mem_page.h        # Page structs (holds multiple pools)
-│   ├── mem_pool.h        # Pool structs (chunks of memory to serve allocs)
-│   └── mem_interfaces.h  # Low-level list/tree utilities
-├── Makefile              # Simple build and run rules
-├── CMakeLists.txt        # If you prefer CMake
-└── .gitignore            # Usual stuff
+│   ├── mem_ctx.c         # Core allocator implementation
+│   ├── mem_ctx.h         # Allocator context and public API
+│   ├── mem_interfaces.h  # Internal list and tree helpers
+│   ├── mem_page.h        # Page metadata
+│   └── mem_pool.h        # Pool metadata and constants
+├── Makefile              # Simple GCC build
+├── CMakeLists.txt        # CMake build configuration
+└── README.md
 ```
 
-## 🚀 How It Works (Short Version)
+## How It Works
 
-- We use pages, which contain pools, which hold actual memory.
-- Small allocations (<= 4096 bytes) go through the custom system.
-- Bigger ones just fall back to regular `malloc`.
-- Internally, there's a **Red-Black Tree** for fast memory page lookup.
-- Pools are recycled, and we keep track of used/free chunks manually.
+The allocator stores memory in this structure:
 
-## 🧪 `main.c` - Benchmarking
+```text
+mem_ctx -> pages -> pools -> fixed-size blocks
+```
 
-In `main.c`, we benchmark both allocators by doing a ton of allocations and deallocations:
+Each page owns `64` pools. Each pool owns `4096` bytes and serves one block
+size. When a small allocation is requested, the allocator rounds the request up
+to the nearest supported power-of-two size class and returns a block from a pool
+for that class.
+
+Requests larger than `4096` bytes are passed to the standard library allocator.
+
+## Allocation Strategy
+
+This allocator uses size-class selection as part of a best-fit strategy. It does
+not scan every free block in the heap. Instead, it chooses the smallest
+power-of-two size class that can hold the request.
+
+Examples:
+
+- `13` bytes -> `16` byte block
+- `100` bytes -> `128` byte block
+- `2000` bytes -> `2048` byte block
+- `4097` bytes -> system `malloc`
+
+This significantly reduced fragmentation compared with placing many different
+object sizes into one shared region. Small objects stay with small objects,
+larger pooled objects stay with their own size class, and freed blocks are
+reused by future allocations of the same size.
+
+The tradeoff is internal fragmentation: because requests are rounded up, some
+bytes inside each block may be unused.
+
+## Free Lists
+
+When a block is freed, the allocator stores the previous free-list pointer
+directly inside that freed block. This avoids extra metadata allocation and
+makes allocation/free operations very small.
+
+Because the free-list pointer lives inside freed memory, writing to memory after
+`mem_free` can corrupt the allocator's internal state. This allocator does not
+currently detect use-after-free, double-free, or invalid-free bugs.
+
+## Pages And Pools
+
+Pools are allocated from pages. A page tracks which pools are currently used and
+which pools are available for reuse. When a pool becomes empty, it can be
+returned to the page. When a page has no active pools, it is removed from the
+active page tree and kept in a free-page list for later reuse.
+
+The allocator also keeps a red-black tree of active pages. During `mem_free` and
+`mem_realloc`, this tree is used to find whether a pointer belongs to a managed
+page or should be handled by the standard allocator.
+
+## Why There Is No Coalescing
+
+Classic coalescing merges neighboring free blocks into one larger block. That is
+useful for variable-size heap allocators, but this allocator is based on fixed
+size classes.
+
+Each pool serves exactly one block size, so freed blocks simply return to the
+free list for that pool. Merging neighboring blocks would add complexity without
+helping the allocator's main workload.
+
+## Why There Are No Boundary Tags
+
+Boundary tags usually store metadata before and after each allocation so an
+allocator can find neighboring blocks and coalesce them.
+
+This allocator does not coalesce blocks, and each pool already knows the block
+size it serves. Adding headers and footers would increase memory overhead, add
+extra writes on the hot path, and could push requests into larger size classes.
+
+## API Example
 
 ```c
-perf_test(&ctx, 1024 * 4);
+#include "memory/mem_ctx.h"
+
+int main(void) {
+    struct mem_ctx ctx = {0};
+
+    int *values = mem_calloc(&ctx, 16, sizeof(int));
+    values = mem_realloc(&ctx, values, 32 * sizeof(int));
+
+    mem_free(&ctx, values);
+    return 0;
+}
 ```
 
-The results show clear speedups for the custom one when working with lots of small blocks. \
-Like... really noticeable improvements.
+Use the same `mem_ctx` for allocations that should share allocator state.
 
+## Build And Run
 
-## 🛠️ Build & Run
+With Make:
 
-### 🔧 With Make:
 ```bash
 make my_memory
 make run
 ./main.a
 ```
 
-### 🧱 Or with CMake:
+With CMake:
+
 ```bash
-mkdir build && cd build
-cmake ..
-make
-./memory_allocator
+cmake -S . -B build
+cmake --build build
+./build/memory_allocator
 ```
 
-## ⚠️ Notes
+## Benchmark
 
-- This is an educational / experimental project.
-- It’s tuned for small, frequent allocations — not general-purpose replacement (yet).
-- Some parts are still being refined (like tree visualization or advanced reuse logic).
+`main.c` runs repeated allocation, zero-fill, and free cycles:
 
-## 💡 Why?
+```c
+perf_test(&ctx, 1024 * 4);
+```
 
-Because `malloc` is a general-purpose beast, and sometimes, **you just need something leaner**.\
-Also — building allocators is fun 😄
+The output compares the custom allocator with standard allocation:
 
-## 📝 Planning
+```text
+          malloc   free
+my_time : ...
+time    : ...
+```
 
-1. [ ] Add support for realloc
-2. [ ] Add leak detection / reporting
-3. [ ] Visualize allocator structure (page/pool map)
-4. [ ] Add thread-safety (maybe with __thread or lock-free queues)
-5. [ ] Integrate into real-world app or game engine
-6. [ ] Benchmark with different allocation patterns (not just 4KB blocks)
+This benchmark is useful for a quick comparison, but it is not a complete
+allocator performance study. Real performance depends on allocation size,
+allocation lifetime, reuse patterns, CPU cache behavior, and the system
+allocator.
+
+## Limitations
+
+- Educational and experimental code, not production-ready.
+- Not thread-safe.
+- No built-in detection for double-free, invalid-free, or use-after-free.
+- `mem_calloc` does not currently check for multiplication overflow.
+- Empty pages are cached for reuse instead of being unmapped immediately.
+- Benchmark coverage is narrow and should be expanded.
+
+## Roadmap
+
+- Add leak detection and allocation reports.
+- Add allocator visualization for pages, pools, and size classes.
+- Add thread-safety or thread-local contexts.
+- Expand benchmarks across more allocation patterns.
+- Add focused tests for allocation, reuse, large fallback, and `realloc`.
